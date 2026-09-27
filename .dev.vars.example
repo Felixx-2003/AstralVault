@@ -1,0 +1,6 @@
+SESSION_SECRET=replace-this-with-a-long-random-development-secret
+# Optional Stripe integration settings. Keep checkout disabled until account recovery exists.
+# PAYMENTS_TEST_ENABLED=false
+# ACCOUNT_RECOVERY_ENABLED=false
+# STRIPE_SECRET_KEY=sk_test_replace-with-test-key
+# STRIPE_WEBHOOK_SECRET=whsec_replace-with-test-endpoint-secret
