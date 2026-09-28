@@ -1,6 +1,24 @@
 ﻿# Verification notes
 
-## Manual browser and API checks (local Worker + D1)
+## Rescue deployment (2026-09-28)
+
+- Remote D1 migration `0004_star_island_rescue.sql` applied successfully.
+- Production Worker version: `42d68fe7-ebb5-4c64-8fd4-88118d9717db`.
+- HTTP health checks passed: homepage returned 200, catalog returned eight heroes and twenty stages, and database-backed guest state returned successfully.
+- No new visual review or manual gameplay session was performed; the user owns those checks and feedback. Paid checkout remains disabled.
+
+## Rescue redesign checks (local, 2026-09-27)
+
+- Migration 0004 preserved an existing save's four cards, rolled stats, levels, 22 pulls and 100 credits; its empty team was filled with Pax/Eda and the new campaign started at zero.
+- A fresh guest received both starter cards, an equipped team and three free pulls.
+- Actual Worker playthrough of island one: stages 1–5 cleared with starters; two simultaneous boss requests produced one success and one cooldown rejection. The saved balance was exactly 625 credits and 60 shards, Tomas joined the three-member team, and five stage records were stored.
+- Replaying that boss paid only 35 credits and 2 shards, with no recruit or boss bonus and no campaign advancement. Duplicate first-battle requests returned the same receipt; locked stages and injected reward fields returned 400.
+- Independent deterministic simulation completed all 20 encounters using only starter and guaranteed boss recruits, correct tactics and earned upgrades. No random summons, purchases, practice farming or daily reset were needed. The final team levels were 3/2/2/2, with 102 shards remaining after the last boss.
+- A full local Worker/D1 playthrough also completed all 20 stages through real API actions. A level-1 crew lost stage 18 without losing currency, then recovered through earned upgrades. The final save contained 54/60 stars, all twenty records, 1,500 credits and 102 shards; no summons or paid credits were used. It included one practice replay to check boss protection.
+- Final automated verification on 2026-09-28: all 37 tests passed across three suites; TypeScript checking and the Vite production build passed. Coverage includes starter crews, stage/tactic validation, battle snapshots, reward caps, concurrent boss rewards, duplicate recruits and a guaranteed-recruit 20-stage route.
+- From 2026-09-28 onward, visual review and gameplay experience testing belong to the user; the agent verifies code and automated tests only unless asked otherwise. Earlier manual checks below are historical.
+
+## Initial release manual browser and API checks (local Worker + D1)
 
 Verified using Playwright against http://127.0.0.1:8787, desktop 1440x960 and mobile 390x844.
 

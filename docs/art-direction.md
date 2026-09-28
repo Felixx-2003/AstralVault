@@ -1,6 +1,6 @@
 # Art assets
 
-The four current character illustrations were generated with the built-in ImageGen tool, then visually checked and placed in `public/art/`. They are original 2D anime sci-fi character art with clean cel shading, angular costume design and restrained palettes.
+The eight current character illustrations were generated with the built-in ImageGen tool, then visually checked and placed in `public/art/`. They are original 2D anime sci-fi character art with clean cel shading, angular costume design and restrained palettes.
 
 - `featured.png` — Selene, silver-lilac lunar knight in a wide banner composition, with dark negative space on the left for copy.
 - `kael-rowanveil.png` — Kael Rowanveil, jade-haired adult guardian carrying an energy spear in an orbital observatory.
@@ -14,7 +14,7 @@ The four current character illustrations were generated with the built-in ImageG
 The four latter portraits were also generated with the same original anime sci-fi art direction. The final versions avoid photorealistic rendering, franchise characters and copied logos.
 # Art direction - approved correction
 
-The user explicitly requested a Chinese anime mobile game (??) look inspired by Honkai: Star Rail. The initial realistic fantasy artwork was rejected and has been replaced.
+The user initially requested a Chinese anime mobile game (二游) look inspired by Honkai: Star Rail. The initial realistic fantasy artwork was rejected and has been replaced. The later gameplay redesign allows a more animated/cartoon treatment: readable combat, playful original enemy silhouettes and clear mobile/desktop controls take priority over matching that reference.
 
 ## Visual rules
 - Fine ink linework, expressive anime faces, flat local colors, crisp two-tone cel shading.

@@ -10,6 +10,7 @@ function nextKey() { idempotency += 1; return `test-action-${String(idempotency)
 async function reset() {
   await env.DB.batch([
     env.DB.prepare('DELETE FROM action_receipts'),
+    env.DB.prepare('DELETE FROM stage_records'),
     env.DB.prepare('DELETE FROM player_team'),
     env.DB.prepare('DELETE FROM collection'),
     env.DB.prepare('DELETE FROM players'),
@@ -25,7 +26,7 @@ async function guest() {
   expect(cookie).toContain('SameSite=Lax');
   expect(cookie).toContain('Secure');
   guestCookie = cookie!.split(';')[0]!;
-  return response.json() as Promise<{ player: { credits: number; freePulls: number; totalPulls: number; shards: number }; collection: unknown[] }>;
+  return response.json() as Promise<{ player: { credits: number; freePulls: number; totalPulls: number; shards: number }; collection: Array<{ id: string }>; team: string[]; campaign: { cleared: number; currentStage: number } }>;
 }
 
 async function get(path: string) {
@@ -42,6 +43,16 @@ async function post(path: string, body: unknown, key = nextKey(), cookie = guest
 
 async function playerRow() {
   return env.DB.prepare('SELECT * FROM players WHERE player_id = ?').bind(guestCookie.split('.')[0]!.split('=')[1]!).first<Record<string, number | string>>();
+}
+
+function playerId() { return guestCookie.split('.')[0]!.split('=')[1]!; }
+
+async function setTeam(ids: string[], level = 1) {
+  const id = playerId();
+  await env.DB.prepare('DELETE FROM player_team WHERE player_id = ?').bind(id).run();
+  await env.DB.batch(ids.map((heroId) => env.DB.prepare('INSERT OR IGNORE INTO collection (player_id, hero_id, level, roll_attack, roll_hp, roll_defense, acquired_at) VALUES (?, ?, ?, 0, 0, 0, ?)').bind(id, heroId, level, Date.now())));
+  await env.DB.batch(ids.map((heroId) => env.DB.prepare('UPDATE collection SET level = ? WHERE player_id = ? AND hero_id = ?').bind(level, id, heroId)));
+  await env.DB.batch(ids.map((heroId, slot) => env.DB.prepare('INSERT INTO player_team (player_id, slot, hero_id) VALUES (?, ?, ?)').bind(id, slot, heroId)));
 }
 
 beforeEach(async () => {
@@ -84,6 +95,9 @@ describe('authoritative guest API', () => {
   it('creates a signed HttpOnly guest cookie and persists free summons in D1', async () => {
     const current = await guest();
     expect(current.player).toMatchObject({ credits: 0, freePulls: 3, totalPulls: 0 });
+    expect(current.collection.map((hero) => hero.id).sort()).toEqual(['eda', 'pax']);
+    expect(current.team).toEqual(['pax', 'eda']);
+    expect(current.campaign).toMatchObject({ cleared: 0, currentStage: 1 });
     const key = nextKey();
     const response = await post('/api/summon', { count: 1 }, key);
     expect(response.status).toBe(200);
@@ -91,7 +105,7 @@ describe('authoritative guest API', () => {
     const after = await get('/api/state').then((result) => result.json()) as typeof current;
     expect(after.player.freePulls).toBe(2);
     expect(after.player.totalPulls).toBe(1);
-    expect(after.collection).toHaveLength(1);
+    expect(after.collection.length).toBeGreaterThanOrEqual(2);
   });
 
   it('replays the same idempotent summon with identical output and rejects a changed body', async () => {
@@ -177,63 +191,79 @@ describe('authoritative guest API', () => {
     expect(after?.count).toBe(before?.count);
   });
 
-  it('uses owned cards for deterministic battles and enforces recovery', async () => {
-    const current = await guest();
-    const playerId = guestCookie.split('.')[0]!.split('=')[1]!;
-    const heroIds = ['selene', 'kael', 'ione', 'nox'];
-    await env.DB.batch(heroIds.map((id) => env.DB.prepare('INSERT INTO collection (player_id, hero_id, level, roll_attack, roll_hp, roll_defense, acquired_at) VALUES (?, ?, 1, 0, 0, 0, ?)').bind(playerId, id, Date.now())));
-    await env.DB.batch(heroIds.map((id, slot) => env.DB.prepare('INSERT INTO player_team (player_id, slot, hero_id) VALUES (?, ?, ?)').bind(playerId, slot, id)));
-    const result = await post('/api/battle', {});
+  it('starts the rescue with a ready crew, strict tactic choices, and authoritative battle events', async () => {
+    await guest();
+    expect((await post('/api/battle', {})).status).toBe(400);
+    expect((await post('/api/battle', { stage: 2, stance: 'assault' })).status).toBe(400);
+    expect((await post('/api/battle', { stage: 1, stance: 'free-win' })).status).toBe(400);
+    const result = await post('/api/battle', { stage: 1, stance: 'assault' });
     expect(result.status).toBe(200);
-    expect(await result.json()).toMatchObject({ won: true, rewardCredits: 75, rewardShards: 4, rounds: 1 });
-    const again = await post('/api/battle', {});
-    expect(again.status).toBe(429);
-    const saved = await get('/api/state').then((response) => response.json()) as typeof current;
-    expect(saved.player.credits).toBe(75);
+    const report = await result.json() as { won: boolean; firstClear: boolean; campaignCleared: number; rewardCredits: number; rewardShards: number; events: Array<{ kind: string; enemyHpAfter: number; crewHpAfter: Record<string, number> }> };
+    expect(report).toMatchObject({ won: true, firstClear: true, campaignCleared: 1, rewardCredits: 75, rewardShards: 8 });
+    expect(report.events.length).toBeGreaterThan(2);
+    expect(report.events.at(-1)).toMatchObject({ kind: 'victory', enemyHpAfter: 0 });
+    expect(report.events[0]?.crewHpAfter).toHaveProperty('pax');
+    expect(report.events[0]?.crewHpAfter).toHaveProperty('eda');
+    expect((await post('/api/battle', { stage: 2, stance: 'break' })).status).toBe(429);
+    const state = await get('/api/state').then((response) => response.json()) as { campaign: { cleared: number; records: Array<{ stage: number; stars: number }> }; player: { credits: number; shards: number } };
+    expect(state.campaign.cleared).toBe(1);
+    expect(state.campaign.records).toMatchObject([{ stage: 1 }]);
+    expect(state.player).toMatchObject({ credits: 75, shards: 8 });
   });
 
-  it('caps daily battle credits under concurrency while preserving battle shards', async () => {
+  it('caps ordinary battle supplies and gives smaller practice rewards without advancing the story', async () => {
     await guest();
-    const playerId = guestCookie.split('.')[0]!.split('=')[1]!;
     const today = new Date().toISOString().slice(0, 10);
-    const heroIds = ['selene', 'kael', 'ione', 'nox'];
-    await env.DB.batch(heroIds.map((id) => env.DB.prepare('INSERT INTO collection (player_id, hero_id, level, roll_attack, roll_hp, roll_defense, acquired_at) VALUES (?, ?, 1, 0, 0, 0, ?)').bind(playerId, id, Date.now())));
-    await env.DB.batch(heroIds.map((id, slot) => env.DB.prepare('INSERT INTO player_team (player_id, slot, hero_id) VALUES (?, ?, ?)').bind(playerId, slot, id)));
-    await env.DB.prepare('UPDATE players SET battle_reward_day = ?, battle_reward_credits = 475, last_battle_at = 0 WHERE player_id = ?').bind(today, playerId).run();
-
-    const concurrent = await Promise.all([post('/api/battle', {}, nextKey()), post('/api/battle', {}, nextKey())]);
-    expect(concurrent.filter((response) => response.status === 200)).toHaveLength(1);
-    expect(concurrent.filter((response) => response.status !== 200).every((response) => response.status === 409 || response.status === 429)).toBe(true);
-    const won = concurrent.find((response) => response.status === 200)!;
-    expect(await won.json()).toMatchObject({ won: true, rewardCredits: 25, rewardShards: 4, battleCreditsRemaining: 0 });
-    let row = await playerRow();
-    expect(row?.battle_reward_credits).toBe(500);
-    expect(row?.soft_balance).toBe(25);
-    expect(row?.shards).toBe(4);
-
-    await env.DB.prepare('UPDATE players SET last_battle_at = 0, battle_wins = 0 WHERE player_id = ?').bind(playerId).run();
-    const afterCap = await post('/api/battle', {});
-    expect(afterCap.status).toBe(200);
-    expect(await afterCap.json()).toMatchObject({ won: true, rewardCredits: 0, rewardShards: 4, battleCreditsRemaining: 0 });
-    row = await playerRow();
-    expect(row?.battle_reward_credits).toBe(500);
-    expect(row?.soft_balance).toBe(25);
-    expect(row?.shards).toBe(8);
+    await env.DB.prepare('UPDATE players SET campaign_cleared = 1, battle_reward_day = ?, battle_reward_credits = 490, battle_reward_shards = 119 WHERE player_id = ?').bind(today, playerId()).run();
+    const first = await post('/api/battle', { stage: 1, stance: 'assault' });
+    expect(first.status).toBe(200);
+    expect(await first.json()).toMatchObject({ won: true, practice: true, firstClear: false, rewardCredits: 10, rewardShards: 1, battleCreditsRemaining: 0, battleShardsRemaining: 0, campaignCleared: 1 });
+    await env.DB.prepare('UPDATE players SET last_battle_at = 0 WHERE player_id = ?').bind(playerId()).run();
+    const second = await post('/api/battle', { stage: 1, stance: 'assault' });
+    expect(second.status).toBe(200);
+    expect(await second.json()).toMatchObject({ won: true, practice: true, rewardCredits: 0, rewardShards: 0, campaignCleared: 1 });
+    expect(await playerRow()).toMatchObject({ soft_balance: 10, shards: 1, battle_reward_credits: 500, battle_reward_shards: 120, campaign_cleared: 1 });
   });
 
-  it('resets battle credit allowance by UTC date without affecting daily claim rewards', async () => {
+  it('pays a boss first clear once under concurrency, grants Tomas, and never repeats the milestone on practice', async () => {
     await guest();
-    const playerId = guestCookie.split('.')[0]!.split('=')[1]!;
-    const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
-    const heroIds = ['selene', 'kael', 'ione', 'nox'];
-    await env.DB.batch(heroIds.map((id) => env.DB.prepare('INSERT INTO collection (player_id, hero_id, level, roll_attack, roll_hp, roll_defense, acquired_at) VALUES (?, ?, 1, 0, 0, 0, ?)').bind(playerId, id, Date.now())));
-    await env.DB.batch(heroIds.map((id, slot) => env.DB.prepare('INSERT INTO player_team (player_id, slot, hero_id) VALUES (?, ?, ?)').bind(playerId, slot, id)));
-    await env.DB.prepare('UPDATE players SET battle_reward_day = ?, battle_reward_credits = 500 WHERE player_id = ?').bind(yesterday, playerId).run();
+    await env.DB.prepare('UPDATE players SET campaign_cleared = 4 WHERE player_id = ?').bind(playerId()).run();
+    const body = { stage: 5, stance: 'break' };
+    const keys = [nextKey(), nextKey()];
+    const responses = await Promise.all(keys.map((key) => post('/api/battle', body, key)));
+    expect(responses.filter((response) => response.status === 200)).toHaveLength(1);
+    expect(responses.filter((response) => response.status !== 200).every((response) => response.status === 409 || response.status === 429)).toBe(true);
+    const winner = responses.find((response) => response.status === 200)!;
+    const winnerIndex = responses.indexOf(winner);
+    const first = await winner.json();
+    expect(first).toMatchObject({ won: true, firstClear: true, campaignCleared: 5, bonusCredits: 200, bonusShards: 20, milestoneHeroId: 'tomas', milestoneDuplicate: false, rewardCredits: 295, rewardShards: 28 });
+    const replay = await post('/api/battle', body, keys[winnerIndex]);
+    expect(replay.status).toBe(200);
+    expect(await replay.json()).toEqual(first);
+    expect(await playerRow()).toMatchObject({ campaign_cleared: 5, soft_balance: 295, shards: 28 });
+    const roster = await get('/api/state').then((response) => response.json()) as { collection: Array<{ id: string }>; team: string[]; campaign: { records: Array<{ stage: number }> } };
+    expect(roster.collection.filter((hero) => hero.id === 'tomas')).toHaveLength(1);
+    expect(roster.team).toContain('tomas');
+    expect(roster.campaign.records).toContainEqual(expect.objectContaining({ stage: 5 }));
+    await env.DB.prepare('UPDATE players SET last_battle_at = 0 WHERE player_id = ?').bind(playerId()).run();
+    const practice = await post('/api/battle', body);
+    expect(practice.status).toBe(200);
+    expect(await practice.json()).toMatchObject({ won: true, practice: true, firstClear: false, bonusCredits: 0, bonusShards: 0, milestoneHeroId: null, rewardCredits: 35, rewardShards: 2, campaignCleared: 5 });
+  });
 
-    const result = await post('/api/battle', {});
+  it('converts an already-owned boss recruit to shards and resets daily battle limits at UTC midnight', async () => {
+    await guest();
+    await setTeam(['pax', 'eda', 'tomas', 'mira'], 3);
+    const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+    await env.DB.prepare('UPDATE players SET campaign_cleared = 9, battle_reward_day = ?, battle_reward_credits = 500, battle_reward_shards = 120 WHERE player_id = ?').bind(yesterday, playerId()).run();
+    const result = await post('/api/battle', { stage: 10, stance: 'guard' });
     expect(result.status).toBe(200);
-    expect(await result.json()).toMatchObject({ won: true, rewardCredits: 75, battleCreditsRemaining: 425 });
-    const state = await get('/api/state').then((response) => response.json()) as { battle: { rewardCreditsEarned: number; rewardCreditsRemaining: number } };
-    expect(state.battle).toMatchObject({ rewardCreditsEarned: 75, rewardCreditsRemaining: 425 });
+    expect(await result.json()).toMatchObject({ won: true, firstClear: true, campaignCleared: 10, bonusCredits: 200, bonusShards: 32, milestoneHeroId: 'mira', milestoneDuplicate: true });
+    const row = await playerRow();
+    expect(row?.battle_reward_credits).toBe(120);
+    expect(row?.battle_reward_shards).toBe(8);
+    const state = await get('/api/state').then((response) => response.json()) as { battle: { rewardCreditsRemaining: number; rewardShardsRemaining: number }; collection: Array<{ id: string }> };
+    expect(state.battle).toMatchObject({ rewardCreditsRemaining: 380, rewardShardsRemaining: 112 });
+    expect(state.collection.filter((hero) => hero.id === 'mira')).toHaveLength(1);
   });
 });

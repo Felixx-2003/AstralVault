@@ -1,5 +1,6 @@
 import { DAILY_REWARD, HEROES, HERO_BY_ID, PITY, PULL_ODDS, STARTING_FREE_PULLS, SUMMON_COST } from '../shared/catalog';
 import { deriveStats, resolveBattle, secureRandom, simulateSummons, type BattleUnit, type OwnedCard } from '../shared/engine';
+import { BATTLE_DAILY_CREDIT_CAP, BATTLE_DAILY_SHARD_CAP, BOSS_BONUS, CAMPAIGN_ISLANDS, CAMPAIGN_LENGTH, CAMPAIGN_STAGES, PRACTICE_REWARD, campaignStage, type Stance } from '../shared/campaign';
 import { createCheckout, handleStripeWebhook, PAYMENT_PACKS } from './payments';
 
 interface PlayerRow {
@@ -17,6 +18,9 @@ interface PlayerRow {
   last_battle_at: number;
   battle_reward_day: string | null;
   battle_reward_credits: number;
+  battle_reward_shards: number;
+  campaign_cleared: number;
+  starter_team_granted: number;
   created_at: number;
 }
 
@@ -49,8 +53,7 @@ type Replay = { kind: 'new' } | { kind: 'replay'; response: Response };
 
 const JSON_HEADERS = { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' };
 const COOKIE_NAME = 'astral_session';
-const BATTLE_COOLDOWN_SECONDS = 20;
-const BATTLE_DAILY_CREDIT_CAP = 500;
+const BATTLE_COOLDOWN_SECONDS = 3;
 const GUEST_CREATION_LIMIT = 10;
 const GUEST_CREATION_WINDOW_SECONDS = 60 * 60;
 const STORE = {
@@ -143,8 +146,15 @@ async function sessionFor(request: Request, env: Env, allowCreate = true): Promi
   if (!await takeGuestCreationSlot(request, env)) throw new ApiError(429, 'Too many new guest archives from this connection. Please try again later.');
 
   const playerId = crypto.randomUUID();
-  await env.DB.prepare('INSERT INTO players (player_id, free_pulls, created_at) VALUES (?, ?, ?)')
-    .bind(playerId, STARTING_FREE_PULLS, Date.now()).run();
+  const createdAt = Date.now();
+  await env.DB.batch([
+    env.DB.prepare('INSERT INTO players (player_id, free_pulls, starter_team_granted, created_at) VALUES (?, ?, 1, ?)')
+      .bind(playerId, STARTING_FREE_PULLS, createdAt),
+    ...(['pax', 'eda'] as const).map((heroId) => env.DB.prepare('INSERT INTO collection (player_id, hero_id, level, roll_attack, roll_hp, roll_defense, acquired_at) VALUES (?, ?, 1, 0, 0, 0, ?)')
+      .bind(playerId, heroId, createdAt)),
+    ...(['pax', 'eda'] as const).map((heroId, slot) => env.DB.prepare('INSERT INTO player_team (player_id, slot, hero_id) VALUES (?, ?, ?)')
+      .bind(playerId, slot, heroId)),
+  ]);
   const signed = `${playerId}.${await hmac(secret, playerId)}`;
   const secure = new URL(request.url).protocol === 'https:' ? '; Secure' : '';
   const cookie = `${COOKIE_NAME}=${signed}; Path=/; Max-Age=31536000; HttpOnly; SameSite=Lax${secure}`;
@@ -248,10 +258,11 @@ function dayKey(timestamp = Date.now()): string {
 }
 
 async function getState(db: D1Database, playerId: string): Promise<Record<string, unknown>> {
-  const [playerResult, collectionResult, teamResult] = await db.batch([
+  const [playerResult, collectionResult, teamResult, recordsResult] = await db.batch([
     db.prepare('SELECT * FROM players WHERE player_id = ?').bind(playerId),
     db.prepare('SELECT hero_id, level, roll_attack, roll_hp, roll_defense, acquired_at FROM collection WHERE player_id = ?').bind(playerId),
     db.prepare('SELECT hero_id FROM player_team WHERE player_id = ? ORDER BY slot ASC').bind(playerId),
+    db.prepare('SELECT stage, best_stars, best_rounds FROM stage_records WHERE player_id = ? ORDER BY stage ASC').bind(playerId),
   ]);
   const player = (playerResult.results as PlayerRow[] | undefined)?.[0];
   if (!player) throw new ApiError(401, 'Guest session expired. Refresh the game to start a new guest session.');
@@ -272,6 +283,10 @@ async function getState(db: D1Database, playerId: string): Promise<Record<string
   const reset = new Date(`${today}T00:00:00.000Z`);
   reset.setUTCDate(reset.getUTCDate() + 1);
   const battleCreditsEarned = player.battle_reward_day === today ? Number(player.battle_reward_credits) : 0;
+  const battleShardsEarned = player.battle_reward_day === today ? Number(player.battle_reward_shards) : 0;
+  const cleared = Math.min(CAMPAIGN_LENGTH, Number(player.campaign_cleared));
+  const records = ((recordsResult.results as { stage: number; best_stars: number; best_rounds: number }[] | undefined) || [])
+    .map((row) => ({ stage: Number(row.stage), stars: Number(row.best_stars), bestRounds: Number(row.best_rounds) }));
   return {
     player: {
       credits: player.soft_balance,
@@ -288,12 +303,24 @@ async function getState(db: D1Database, playerId: string): Promise<Record<string
     collection,
     team: ((teamResult.results as { hero_id: string }[] | undefined) || []).map((row) => row.hero_id),
     daily: { available: player.last_daily !== today, reward: DAILY_REWARD, nextResetUtc: reset.toISOString() },
+    campaign: {
+      cleared,
+      total: CAMPAIGN_LENGTH,
+      complete: cleared >= CAMPAIGN_LENGTH,
+      currentStage: Math.min(CAMPAIGN_LENGTH, cleared + 1),
+      nextBoss: cleared >= CAMPAIGN_LENGTH ? null : Math.ceil((cleared + 1) / 5) * 5,
+      records,
+      stars: records.reduce((total, record) => total + record.stars, 0),
+    },
     battle: {
       cooldownSeconds: lastBattleRemaining,
-      stage: player.battle_wins + 1,
+      stage: Math.min(CAMPAIGN_LENGTH, cleared + 1),
       rewardCreditsEarned: battleCreditsEarned,
       rewardCreditsCap: BATTLE_DAILY_CREDIT_CAP,
       rewardCreditsRemaining: Math.max(0, BATTLE_DAILY_CREDIT_CAP - battleCreditsEarned),
+      rewardShardsEarned: battleShardsEarned,
+      rewardShardsCap: BATTLE_DAILY_SHARD_CAP,
+      rewardShardsRemaining: Math.max(0, BATTLE_DAILY_SHARD_CAP - battleShardsEarned),
     },
     store: STORE,
   };
@@ -308,7 +335,7 @@ async function routeApi(request: Request, env: Env, playerId: string): Promise<R
   const method = request.method.toUpperCase();
 
   if (method === 'GET' && pathname === '/api/catalog') {
-    return json({ heroes: HEROES, odds: PULL_ODDS, pity: PITY, summonCost: SUMMON_COST, startingFreePulls: STARTING_FREE_PULLS, dailyReward: DAILY_REWARD, store: STORE });
+    return json({ heroes: HEROES, odds: PULL_ODDS, pity: PITY, summonCost: SUMMON_COST, startingFreePulls: STARTING_FREE_PULLS, dailyReward: DAILY_REWARD, islands: CAMPAIGN_ISLANDS, stages: CAMPAIGN_STAGES, store: STORE });
   }
   if (method === 'GET' && pathname === '/api/state') {
     return json(await getState(env.DB, playerId));
@@ -456,7 +483,16 @@ async function routeApi(request: Request, env: Env, playerId: string): Promise<R
   }
 
   if (pathname === '/api/battle') {
-    if (Object.keys(body).length !== 0) throw new ApiError(400, 'Battle results are calculated from your saved team.');
+    if (Object.keys(body).length !== 2 || !Object.hasOwn(body, 'stage') || !Object.hasOwn(body, 'stance')) {
+      throw new ApiError(400, 'Choose a stage and a tactic before fighting. Refresh the game if this action is unavailable.');
+    }
+    const stage = body.stage;
+    const stance = body.stance;
+    if (!Number.isInteger(stage) || typeof stage !== 'number' || stage < 1 || stage > CAMPAIGN_LENGTH || stage > Number(player.campaign_cleared) + 1) {
+      throw new ApiError(400, 'Choose the next rescue stage or one you have already cleared.');
+    }
+    if (stance !== 'assault' && stance !== 'guard' && stance !== 'break') throw new ApiError(400, 'Choose Assault, Guard, or Break.');
+    const encounter = campaignStage(stage);
     const elapsed = Math.floor((Date.now() - player.last_battle_at) / 1000);
     if (player.last_battle_at > 0 && elapsed < BATTLE_COOLDOWN_SECONDS) {
       throw new ApiError(429, `Your crew needs ${BATTLE_COOLDOWN_SECONDS - elapsed} more seconds to recover.`);
@@ -474,20 +510,72 @@ async function routeApi(request: Request, env: Env, playerId: string): Promise<R
       return [{ heroId: hero.id, name: hero.name, hp: stats.hp, maxHp: stats.hp, attack: stats.attack, defense: stats.defense, skillId: hero.skillId }];
     });
     if (team.length === 0) throw new ApiError(409, 'Assign at least one card to your team before battle.');
-    const report = resolveBattle(team, player.battle_wins);
+    const report = resolveBattle(team, stage, stance as Stance);
+    const firstClear = report.won && stage === Number(player.campaign_cleared) + 1;
+    const practice = stage <= Number(player.campaign_cleared);
     const today = dayKey();
-    const earnedBefore = player.battle_reward_day === today ? Number(player.battle_reward_credits) : 0;
-    const rewardCredits = report.won ? Math.min(report.rewardCredits, Math.max(0, BATTLE_DAILY_CREDIT_CAP - earnedBefore)) : 0;
+    const creditsBefore = player.battle_reward_day === today ? Number(player.battle_reward_credits) : 0;
+    const shardsBefore = player.battle_reward_day === today ? Number(player.battle_reward_shards) : 0;
+    const baseCredits = report.won ? Math.min(firstClear ? report.rewardCredits : PRACTICE_REWARD.credits, Math.max(0, BATTLE_DAILY_CREDIT_CAP - creditsBefore)) : 0;
+    const baseShards = report.won ? Math.min(firstClear ? report.rewardShards : PRACTICE_REWARD.shards, Math.max(0, BATTLE_DAILY_SHARD_CAP - shardsBefore)) : 0;
+    const bossClear = firstClear && encounter.boss;
+    const bonusCredits = bossClear ? BOSS_BONUS.credits : 0;
+    const milestoneHeroId = bossClear && stage === 5 ? 'tomas' : bossClear && stage === 10 ? 'mira' : null;
+    const milestoneOwned = milestoneHeroId ? await env.DB.prepare('SELECT 1 AS owned FROM collection WHERE player_id = ? AND hero_id = ?')
+      .bind(playerId, milestoneHeroId).first<{ owned: number }>() : null;
+    const bonusShards = (bossClear ? BOSS_BONUS.shards : 0) + (milestoneOwned ? 12 : 0);
+    const rewardCredits = baseCredits + bonusCredits;
+    const rewardShards = baseShards + bonusShards;
+    const maxTeamHp = team.reduce((sum, unit) => sum + unit.maxHp, 0);
+    const stars = report.won ? 1 + Number(report.rounds <= 5) + Number(report.remainingHp >= maxTeamHp * 0.6) : 0;
     const responseBody = {
       ...report,
+      firstClear,
+      practice,
+      stars,
       rewardCredits,
+      rewardShards,
+      baseCredits,
+      baseShards,
+      bonusCredits,
+      bonusShards,
+      milestoneHeroId,
+      milestoneDuplicate: Boolean(milestoneOwned),
+      campaignCleared: firstClear ? stage : Number(player.campaign_cleared),
       cooldownSeconds: BATTLE_COOLDOWN_SECONDS,
-      battleCreditsRemaining: Math.max(0, BATTLE_DAILY_CREDIT_CAP - earnedBefore - rewardCredits),
+      battleCreditsRemaining: Math.max(0, BATTLE_DAILY_CREDIT_CAP - creditsBefore - baseCredits),
+      battleShardsRemaining: Math.max(0, BATTLE_DAILY_SHARD_CAP - shardsBefore - baseShards),
     };
+    const gate = receiptGate(playerId, key, actionId);
+    const afterUpdate: D1PreparedStatement[] = [];
+    if (report.won) {
+      afterUpdate.push(env.DB.prepare(`
+        INSERT INTO stage_records (player_id, stage, best_stars, best_rounds, updated_at)
+        SELECT ?, ?, ?, ?, ? WHERE ${gate.sql}
+        ON CONFLICT(player_id, stage) DO UPDATE SET
+          best_stars = MAX(best_stars, excluded.best_stars),
+          best_rounds = MIN(best_rounds, excluded.best_rounds),
+          updated_at = excluded.updated_at
+      `).bind(playerId, stage, stars, report.rounds, Date.now(), ...gate.values));
+    }
+    if (milestoneHeroId && !milestoneOwned) {
+      afterUpdate.push(env.DB.prepare(`
+        INSERT OR IGNORE INTO collection (player_id, hero_id, level, roll_attack, roll_hp, roll_defense, acquired_at)
+        SELECT ?, ?, 1, 0, 0, 0, ? WHERE ${gate.sql}
+      `).bind(playerId, milestoneHeroId, Date.now(), ...gate.values));
+    }
+    if (milestoneHeroId) {
+      afterUpdate.push(env.DB.prepare(`
+        INSERT OR IGNORE INTO player_team (player_id, slot, hero_id)
+        SELECT ?, (SELECT COALESCE(MAX(slot) + 1, 0) FROM player_team WHERE player_id = ?), ?
+        WHERE ${gate.sql} AND (SELECT COUNT(*) FROM player_team WHERE player_id = ?) < 4
+      `).bind(playerId, playerId, milestoneHeroId, ...gate.values, playerId));
+    }
     const result = await commitAction(
       env.DB, player, key, 'battle', fingerprint, actionId, responseBody,
-      `UPDATE players SET soft_balance = soft_balance + ?, shards = shards + ?, battle_wins = battle_wins + ?, battle_reward_credits = CASE WHEN battle_reward_day = ? THEN battle_reward_credits + ? ELSE ? END, battle_reward_day = ?, last_battle_at = ?, revision = revision + 1 WHERE player_id = ? AND revision = ? AND last_battle_at = ? AND NOT EXISTS (SELECT 1 FROM action_receipts WHERE player_id = ? AND idempotency_key = ?)`,
-      [rewardCredits, report.rewardShards, report.won ? 1 : 0, today, rewardCredits, rewardCredits, today, Date.now(), playerId, player.revision, player.last_battle_at, playerId, key],
+      `UPDATE players SET soft_balance = soft_balance + ?, shards = shards + ?, battle_wins = battle_wins + ?, campaign_cleared = CASE WHEN ? = 1 THEN ? ELSE campaign_cleared END, battle_reward_credits = CASE WHEN battle_reward_day = ? THEN battle_reward_credits + ? ELSE ? END, battle_reward_shards = CASE WHEN battle_reward_day = ? THEN battle_reward_shards + ? ELSE ? END, battle_reward_day = ?, last_battle_at = ?, revision = revision + 1 WHERE player_id = ? AND revision = ? AND campaign_cleared = ? AND last_battle_at = ? AND NOT EXISTS (SELECT 1 FROM action_receipts WHERE player_id = ? AND idempotency_key = ?)`,
+      [rewardCredits, rewardShards, report.won ? 1 : 0, firstClear ? 1 : 0, stage, today, baseCredits, baseCredits, today, baseShards, baseShards, today, Date.now(), playerId, player.revision, player.campaign_cleared, player.last_battle_at, playerId, key],
+      afterUpdate,
     );
     if (result === 'replay') return (await actionReplay(env.DB, playerId, key, 'battle', fingerprint) as Extract<Replay, { kind: 'replay' }>).response;
     if (result === 'key-conflict') throw new ApiError(409, 'That request key was already used for different data. Start a new action.');

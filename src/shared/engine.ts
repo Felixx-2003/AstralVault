@@ -1,4 +1,5 @@
 import type { Hero, Rarity } from './catalog';
+import { campaignStage, type EnemyIntent, type Stance } from './campaign';
 
 export interface RandomSource {
   unit(): number;
@@ -146,6 +147,10 @@ export interface BattleUnit extends CardStats {
 export interface BattleReport {
   won: boolean;
   stage: number;
+  enemyName: string;
+  intent: EnemyIntent;
+  stance: Stance;
+  countered: boolean;
   rounds: number;
   enemyHp: number;
   enemyMaxHp: number;
@@ -154,21 +159,41 @@ export interface BattleReport {
   remainingHp: number;
   rewardCredits: number;
   rewardShards: number;
+  crew: { heroId: string; name: string; maxHp: number }[];
+  events: BattleEvent[];
   log: string[];
 }
 
-export function resolveBattle(team: BattleUnit[], winsBefore: number): BattleReport {
+export interface BattleEvent {
+  kind: 'hit' | 'enemy' | 'heal' | 'victory' | 'defeat';
+  round: number;
+  actor: string;
+  target: string;
+  amount: number;
+  enemyHpAfter: number;
+  crewHpAfter: Record<string, number>;
+  text: string;
+}
+
+export function resolveBattle(team: BattleUnit[], stageNumber: number, stance: Stance = 'assault'): BattleReport {
   if (team.length < 1 || team.length > 4) throw new RangeError('A battle team must contain one to four units.');
-  const stage = Math.max(1, winsBefore + 1);
-  const enemyMaxHp = 440 + Math.min(stage - 1, 12) * 52;
-  const enemyDefense = 18 + Math.min(12, Math.floor((stage - 1) / 3)) * 2;
-  const enemyAttack = 42 + Math.min(stage - 1, 12) * 3;
+  if (stance !== 'assault' && stance !== 'guard' && stance !== 'break') throw new RangeError('Choose Assault, Guard, or Break.');
+  const encounter = campaignStage(Math.max(1, stageNumber));
+  const stage = encounter.number;
+  const enemyMaxHp = 350 + (stage - 1) * 140;
+  const enemyDefense = 14 + Math.floor((stage - 1) / 3) * 3 + (encounter.intent === 'armor' ? 45 : 0);
+  const enemyAttack = 50 + (stage - 1) * 12 + (encounter.boss ? 20 : 0);
+  const countered = stance === encounter.counter;
   const living = team.map((unit) => ({ ...unit, currentHp: unit.hp, skillUsed: false }));
   let enemyHp = enemyMaxHp;
   let damageDealt = 0;
   let damageTaken = 0;
   let rounds = 0;
-  const log: string[] = [];
+  const events: BattleEvent[] = [];
+  const crewHpAfter = () => Object.fromEntries(living.map((unit) => [unit.heroId, unit.currentHp]));
+  const addEvent = (kind: BattleEvent['kind'], actor: string, target: string, amount: number, text: string) => {
+    events.push({ kind, round: rounds, actor, target, amount, enemyHpAfter: enemyHp, crewHpAfter: crewHpAfter(), text });
+  };
 
   while (enemyHp > 0 && living.some((unit) => unit.currentHp > 0) && rounds < 8) {
     rounds += 1;
@@ -181,24 +206,28 @@ export function resolveBattle(team: BattleUnit[], winsBefore: number): BattleRep
       if (unit.skillId === 'black-comet') { attack = Math.round(attack * 1.18); targetDefense = Math.floor(enemyDefense * 0.75); }
       if (unit.skillId === 'perihelion' && rounds % 3 === 0) attack = Math.round(attack * 1.7);
       if (unit.skillId === 'beacon-thrust' && rounds === 1) attack += 35;
-      if (unit.skillId === 'quiet-index' && rounds === 1) attack += 12;
-      const damage = Math.max(5, attack - Math.floor(targetDefense * 0.4));
+      if (rounds === 1 && living.some((ally) => ally.skillId === 'quiet-index' && ally.currentHp > 0)) attack += 12;
+      if (stance === 'break') targetDefense = Math.floor(targetDefense * (encounter.intent === 'armor' ? 0.15 : 0.55));
+      const stancePower = stance === 'assault' ? 1.18 : stance === 'guard' ? 0.85 : 0.92;
+      const counterPower = countered ? stance === 'assault' ? 1.55 : stance === 'guard' ? 1.4 : 1.6 : 1;
+      const damage = Math.max(5, Math.round((attack - Math.floor(targetDefense * 0.4)) * stancePower * counterPower));
       const dealt = Math.min(enemyHp, damage);
       enemyHp = Math.max(0, enemyHp - dealt);
       damageDealt += dealt;
-      log.push(`${unit.name} deals ${dealt} damage.`);
+      addEvent('hit', unit.name, encounter.enemy, dealt, `${unit.name} hits ${encounter.enemy} for ${dealt}.`);
     }
-    if (enemyHp <= 0) {
-      log.push(`The enemy is defeated in round ${rounds}.`);
-      break;
-    }
+    if (enemyHp <= 0) break;
     const target = living.find((unit) => unit.currentHp > 0);
     if (!target) break;
     let damage = Math.max(6, enemyAttack - Math.floor(target.defense * 0.55));
+    if (encounter.intent === 'heavy') damage = Math.round(damage * (stance === 'guard' ? 0.38 : 1.65));
+    if (encounter.intent === 'charge') damage = Math.round(damage * (stance === 'assault' ? 0.58 : 1.45));
+    if (encounter.intent === 'armor' && stance === 'break') damage = Math.round(damage * 0.82);
     if (target.skillId === 'moonlit-aegis') damage = Math.max(4, Math.floor(damage * 0.75));
+    damage = Math.min(target.currentHp, Math.max(1, damage));
     target.currentHp = Math.max(0, target.currentHp - damage);
     damageTaken += damage;
-    log.push(`The enemy strikes ${target.name} for ${damage}.`);
+    addEvent('enemy', encounter.enemy, target.name, damage, `${encounter.enemy} strikes ${target.name} for ${damage}.`);
     const mechanic = living.find((unit) => unit.skillId === 'patch-kit' && unit.currentHp > 0);
     if (mechanic && !mechanic.skillUsed) {
       const mostWounded = living.filter((unit) => unit.currentHp > 0).sort((a, b) => (a.currentHp / a.maxHp) - (b.currentHp / b.maxHp))[0];
@@ -206,7 +235,7 @@ export function resolveBattle(team: BattleUnit[], winsBefore: number): BattleRep
         const restored = Math.min(mostWounded.maxHp - mostWounded.currentHp, Math.ceil(mechanic.maxHp * 0.12));
         mostWounded.currentHp += restored;
         mechanic.skillUsed = true;
-        log.push(`Pax restores ${restored} health with Patch Kit.`);
+        addEvent('heal', mechanic.name, mostWounded.name, restored, `${mechanic.name} restores ${restored} health to ${mostWounded.name}.`);
       }
     }
     const cartographer = living.find((unit) => unit.skillId === 'low-tide-map' && unit.currentHp > 0);
@@ -217,7 +246,7 @@ export function resolveBattle(team: BattleUnit[], winsBefore: number): BattleRep
         if (restored > 0) {
           mostWounded.currentHp += restored;
           cartographer.skillUsed = true;
-          log.push(`Mira restores ${restored} health with Low-Tide Map.`);
+          addEvent('heal', cartographer.name, mostWounded.name, restored, `${cartographer.name} restores ${restored} health to ${mostWounded.name}.`);
         }
       }
     }
@@ -225,10 +254,15 @@ export function resolveBattle(team: BattleUnit[], winsBefore: number): BattleRep
 
   const won = enemyHp <= 0;
   const remainingHp = living.reduce((total, unit) => total + unit.currentHp, 0);
+  addEvent(won ? 'victory' : 'defeat', won ? 'Crew' : encounter.enemy, won ? encounter.enemy : 'Crew', 0,
+    won ? `${encounter.enemy} retreats. The island path is clear!` : 'The crew falls back. Change tactic or strengthen your team.');
   return {
-    won, stage, rounds, enemyHp, enemyMaxHp, damageDealt, damageTaken, remainingHp,
+    won, stage, enemyName: encounter.enemy, intent: encounter.intent, stance, countered,
+    rounds, enemyHp, enemyMaxHp, damageDealt, damageTaken, remainingHp,
     rewardCredits: won ? 75 + Math.min(stage - 1, 10) * 5 : 0,
-    rewardShards: won ? 4 : 0,
-    log,
+    rewardShards: won ? 8 : 0,
+    crew: living.map((unit) => ({ heroId: unit.heroId, name: unit.name, maxHp: unit.maxHp })),
+    events,
+    log: events.map((event) => event.text),
   };
 }

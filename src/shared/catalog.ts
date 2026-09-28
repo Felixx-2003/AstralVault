@@ -22,7 +22,7 @@ export const HEROES: Hero[] = [
   {
     id: 'selene', name: 'Selene', epithet: 'Keeper of the Far Moon', rarity: 5,
     element: 'Lunar', role: 'Warden', attack: 104, hp: 1020, defense: 82,
-    skillId: 'moonlit-aegis', skill: 'Moonlit Aegis', skillDescription: 'Reduces the damage of every enemy strike by 25%.', art: '/art/featured.png',
+    skillId: 'moonlit-aegis', skill: 'Moonlit Aegis', skillDescription: 'Takes 25% less damage from each enemy strike that hits her.', art: '/art/featured.png',
   },
   {
     id: 'kael', name: 'Kael Rowanveil', epithet: 'Jade Observatory', rarity: 5,
@@ -52,7 +52,7 @@ export const HEROES: Hero[] = [
   {
     id: 'pax', name: 'Pax Juniper', epithet: 'Courier of Small Moons', rarity: 3,
     element: 'Verdant', role: 'Support', attack: 69, hp: 860, defense: 71,
-    skillId: 'patch-kit', skill: 'Patch Kit', skillDescription: 'After an enemy strike, restores 12% health to the most wounded ally.', art: '/art/pax-juniper.png',
+    skillId: 'patch-kit', skill: 'Patch Kit', skillDescription: 'Once per battle, restores up to 12% of Pax’s maximum health to the most wounded ally.', art: '/art/pax-juniper.png',
   },
   {
     id: 'eda', name: 'Eda Sol', epithet: 'Archive After Hours', rarity: 3,
